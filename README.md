@@ -48,7 +48,7 @@ being bought again. It also requires the strategy to be unpaused with its loan o
 - the strategy is not paused and aHYPER is transferable. Either condition already blocks aHYPER ERC-20 transfers, so
   router sales revert anyway; the check also stops sales paid with aHYPER already held in the PoolManager (ERC-6909
   claims);
-- the strategy's `loanState()` is `OngoingLocked` (2) or `OngoingDynamic` (3). Fills stop in the block the state leaves those values; in the current strategy implementation only `acceptDefault()` (to InDefault) and repayment to zero (to Repaid) do that, and `rejectTerms()` changes nothing once the loan is ongoing. A default is initiated by `defaultLoan()` at least one day before `acceptDefault()` can flip the state; during that window `sharePrice()` keeps accruing (faster if delinquency penalties are enabled) and the hook cannot see it (`_defaultValidAt` has no getter). The maker's bot must kill the bid on `LoanDefaultInitiated` and `DelinquencyStatusChanged(true)`.
+- the strategy's `loanState()` is `OngoingLocked` (2) or `OngoingDynamic` (3). Fills stop in the block the state leaves those values; in the current strategy implementation only `acceptDefault()` (to InDefault) and repayment to zero (to Repaid) do that, and `rejectTerms()` changes nothing once the loan is ongoing. A default is initiated by `defaultLoan()` at least one day before `acceptDefault()` can flip the state; during that window `sharePrice()` keeps accruing and the hook cannot see it (`_defaultValidAt` has no getter). The maker's bot must kill the bid while a default is pending.
 - `sharePrice() > 0`, the USDC out is not 0, and the ceiling holds on the realised amounts.
 
 ## Settlement
@@ -77,16 +77,17 @@ being bought again. It also requires the strategy to be unpaused with its loan o
   proxy, so whitelist and KYC checks cannot arise. The strategy's manager can switch `transferableShares` off
   (`setSharesTransferable`); the hook then refuses every fill and every opening, including sales paid with aHYPER
   already in the PoolManager, and `sweep(aHYPER)` reverts until transfers reopen while `sweep(USDC)` still works.
-- Two strategy events do not stop fills on-chain, so the maker's bot must kill the bid on them. `LoanDefaultInitiated`:
-  the state stays ongoing until `acceptDefault()`, at least 1 day later, and the pending default has no public getter.
-  `DelinquencyStatusChanged(true)`: delinquency penalties make `sharePrice()` accrue faster while the borrower is not
-  providing liquidity.
+- A pending default does not stop fills on-chain, so the maker's bot must kill the bid on it: after `defaultLoan()`
+  (`LoanDefaultInitiated`) the state stays ongoing until `acceptDefault()`, at least 1 day later, and the pending
+  default has no public getter (it lives in the private `_defaultValidAt`; the bot reads its storage slot).
+  Delinquency (`DelinquencyStatusChanged(true)`, `_isDelinquent()`) is not on the list: it flags vault liquid assets
+  below the strategy's required reserve, and it has been set while the vault operated normally.
 - Fills depend on the funding vault's liquidity. A vault that lends into a highly utilised market, such as the Morpho
   aHYPER/USDC market, has the least liquidity exactly when exits peak.
 - The price follows the strategy's `sharePrice()`; the strategy is an upgradeable proxy. A wrong price within the
-  ongoing states is not detected on-chain; the maker's bot stops the bid with the kill switch. Its kill list:
-  `LoanDefaultInitiated`, `DelinquencyStatusChanged(true)`, `Upgraded` on the strategy proxy, and a `sharePrice()`
-  jump beyond its threshold (a fulfilled redemption claimed late can step the price up slightly, toward the true share
+  ongoing states is not detected on-chain; the maker's bot stops the bid with the kill switch. Its kill list: a pending
+  default, a strategy implementation other than the one it was verified against (`Upgraded`), and a `sharePrice()`
+  decrease or a jump beyond its threshold (a fulfilled redemption claimed late can step the price up slightly, toward the true share
   value).
 
 ## Notes for the maker's bot
@@ -96,8 +97,8 @@ being bought again. It also requires the strategy to be unpaused with its loan o
 - To re-price or resize a live bid that is being filled, kill first and then open with `expectedRemaining = 0`. Once
   `remaining` is 0 fills revert, so it cannot change underneath the open. A plain re-post can keep reverting
   `RemainingChanged` while fills land; treat that as re-read and retry, never as fatal.
-- Kill on `LoanDefaultInitiated`, `DelinquencyStatusChanged(true)`, `Upgraded` on the strategy proxy, and a
-  `sharePrice()` jump beyond the bot's threshold. Sweep after fills and count unswept aHYPER claims as the maker's.
+- Kill on a pending default, an `Upgraded` strategy proxy, and a `sharePrice()` decrease or a jump beyond the bot's
+  threshold. Sweep after fills and count unswept aHYPER claims as the maker's.
 
 ## Tests
 
@@ -129,7 +130,7 @@ Each guard in the hook was removed or altered one at a time (32 mutants); every 
 
 | | |
 |---|---|
-| PoolManager | `0x188d586DDcF52439676Ca21A244753fA19F9Ea8e` |
+| PoolManager | `0x188d586Ddcf52439676Ca21A244753fA19F9Ea8e` |
 | UniversalRouter | `0x0D97Dc33264bfC1c226207428A79b26757fb9dc3` |
 | aHYPER (Accountable vault share) | `0x7Cd231120a60F500887444a9bAF5e1BD753A5e59` |
 | aHYPER strategy | `0xD0943c76ee287793559c1dF82E5B2B858Dd01Ef3` |
