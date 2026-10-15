@@ -7,6 +7,8 @@ import {IUnlockCallback} from "v4-core/interfaces/callback/IUnlockCallback.sol";
 import {Hooks} from "v4-core/libraries/Hooks.sol";
 import {FullMath} from "v4-core/libraries/FullMath.sol";
 import {SafeCast} from "v4-core/libraries/SafeCast.sol";
+import {StateLibrary} from "v4-core/libraries/StateLibrary.sol";
+import {ProtocolFeeLibrary} from "v4-core/libraries/ProtocolFeeLibrary.sol";
 import {PoolKey} from "v4-core/types/PoolKey.sol";
 import {PoolId, PoolIdLibrary} from "v4-core/types/PoolId.sol";
 import {Currency} from "v4-core/types/Currency.sol";
@@ -35,6 +37,12 @@ interface IERC4626Vault {
     function withdraw(uint256 assets, address receiver, address owner) external returns (uint256 shares);
 }
 
+/// @dev Uniswap's V4FeeAdapter, the PoolManager's protocolFeeController where Uniswap governance has set one, names
+/// the protocol fee recipient.
+interface IProtocolFeeAdapter {
+    function TOKEN_JAR() external view returns (address);
+}
+
 interface IERC20Min {
     function balanceOf(address account) external view returns (uint256);
     function transfer(address to, uint256 amount) external returns (bool);
@@ -52,11 +60,19 @@ interface IERC20Min {
 /// MAKER and anyone can sweep them there. Fills stop on their own when the quote expires, when `remaining` runs out,
 /// while the strategy is paused or the share is not transferable, and whenever the strategy's loanState() is not
 /// ongoing. The state flips on acceptDefault or full repayment; a default initiated by defaultLoan() is not visible
-/// on-chain for at least a day, so the maker's bot must act on its event. The maker's only approval is VAULT shares to
+/// on-chain for at least a day, so the maker's bot must act on it. The maker's only approval is VAULT shares to
 /// this contract, which bounds the USDC the hook can ever pay.
+/// Custom accounting does not bypass the v4 protocol fee: every fill charges the swapper the pool's protocol fee for
+/// the swap direction, as Uniswap governance sets it in the PoolManager, in ASSET, and pays it to the protocol fee
+/// controller's TokenJar (Uniswap's aggregator-hook convention). Swappers are protected by an immutable band on the
+/// maker's discount: the bid never pays less than sharePrice x (1 - MAX_BID_DISCOUNT_BPS / 10,000). A discount change
+/// inside the band takes effect at once, so the band bounds the worst fill; it does not stop the maker repricing a
+/// pending swap whose slippage limit is tighter than the band.
 contract AHyperQuoteHook is IUnlockCallback {
     using PoolIdLibrary for PoolKey;
     using SafeCast for uint256;
+    using StateLibrary for IPoolManager;
+    using ProtocolFeeLibrary for uint24;
 
     error NotPoolManager();
     error NotMaker();
@@ -74,6 +90,7 @@ contract AHyperQuoteHook is IUnlockCallback {
     error AmountExceedsRemaining();
     error TransferFailed();
     error BadConfig();
+    error DiscountAboveMax();
 
     /// @param validUntil Last timestamp at which the bid fills; zero disables it.
     /// @param discountBps Bid = sharePrice x (1 - discountBps / 10,000).
@@ -86,8 +103,13 @@ contract AHyperQuoteHook is IUnlockCallback {
 
     event ParamsSet(Params params);
     /// @param sender The router that called the PoolManager.
+    /// @param sharesIn What the swapper sold.
+    /// @param assetsOut What the swapper received.
+    /// @param protocolFee The ASSET paid to the TokenJar out of the fill: the maker paid assetsOut + protocolFee.
     /// @param sharePrice The share's sharePrice() the fill was priced at.
-    event Filled(address sender, uint256 sharesIn, uint256 assetsOut, uint256 sharePrice);
+    event Filled(address sender, uint256 sharesIn, uint256 assetsOut, uint256 protocolFee, uint256 sharePrice);
+    /// @dev Same shape as Uniswap's aggregator hooks' ProtocolFees event.
+    event ProtocolFeesCollected(address indexed recipient, Currency indexed currency, uint256 amount);
     event Swept(address indexed currency, uint256 amount);
     /// @dev OpenZeppelin uniswap-hooks IHookEvents.HookSwap: amounts from the swapper's side, positive for input and
     /// negative for output; no hook LP fee.
@@ -101,9 +123,12 @@ contract AHyperQuoteHook is IUnlockCallback {
     );
 
     uint256 private constant BPS = 10_000;
+    uint256 private constant PIPS = 1_000_000;
     uint8 private constant ONGOING_LOCKED = 2;
     uint8 private constant ONGOING_DYNAMIC = 3;
     int24 public constant TICK_SPACING = 1;
+    /// @dev Uniswap's V4FeeAdapter answers TOKEN_JAR() (an immutable) in about 400 gas.
+    uint256 private constant TOKEN_JAR_GAS = 50_000;
 
     IPoolManager public immutable POOL_MANAGER;
     IERC4626Vault public immutable VAULT;
@@ -111,8 +136,10 @@ contract AHyperQuoteHook is IUnlockCallback {
     IAccountableStrategy public immutable STRATEGY;
     address public immutable ASSET;
     address public immutable MAKER;
-    /// @notice The bid never exceeds sharePrice x MAX_BID_BPS / 10,000.
+    /// @notice The bid never exceeds sharePrice x MAX_BID_BPS / 10,000 (protects the maker).
     uint256 public immutable MAX_BID_BPS;
+    /// @notice The bid never falls below sharePrice x (1 - MAX_BID_DISCOUNT_BPS / 10,000) (protects the swapper).
+    uint256 public immutable MAX_BID_DISCOUNT_BPS;
     /// @notice SHARE.precision(), the scale of sharePrice().
     uint256 public immutable PRECISION;
     /// @notice The canonical pool: {SHARE, ASSET} sorted, static zero LP fee, TICK_SPACING, this hook.
@@ -123,10 +150,18 @@ contract AHyperQuoteHook is IUnlockCallback {
 
     Params public params;
 
-    constructor(address poolManager, address vault, address share, address maker, uint256 maxBidBps) {
+    constructor(
+        address poolManager,
+        address vault,
+        address share,
+        address maker,
+        uint256 maxBidBps,
+        uint256 maxBidDiscountBps
+    ) {
+        // The discount band must be non-empty: some d satisfies BPS - maxBidBps <= d <= maxBidDiscountBps < BPS.
         if (
             poolManager == address(0) || vault == address(0) || share == address(0) || maker == address(0)
-                || maxBidBps == 0 || maxBidBps > BPS
+                || maxBidBps == 0 || maxBidBps > BPS || maxBidDiscountBps >= BPS || BPS - maxBidBps > maxBidDiscountBps
         ) revert BadConfig();
         address asset = IERC4626Vault(vault).asset();
         // The vault must pay out the very asset the share is denominated in.
@@ -142,6 +177,7 @@ contract AHyperQuoteHook is IUnlockCallback {
         ASSET = asset;
         MAKER = maker;
         MAX_BID_BPS = maxBidBps;
+        MAX_BID_DISCOUNT_BPS = maxBidDiscountBps;
         PRECISION = precision;
         SHARE_ID = uint256(uint160(share));
         ASSET_ID = uint256(uint160(asset));
@@ -189,7 +225,7 @@ contract AHyperQuoteHook is IUnlockCallback {
     /// maker can always stop the bid, even while the share or its strategy reverts. Opening or changing a live bid
     /// requires `expectedRemaining` to equal the stored `remaining` (so a fill that lands between the maker reading the
     /// bid and this call is never bought again), the strategy to be unpaused with its loan ongoing, the share to be
-    /// transferable, sharePrice() above zero, discountBps < 10,000 and 10,000 - discountBps <= MAX_BID_BPS.
+    /// transferable, sharePrice() above zero, and 10,000 - MAX_BID_BPS <= discountBps <= MAX_BID_DISCOUNT_BPS.
     function setParams(Params calldata p, uint128 expectedRemaining) external {
         if (msg.sender != MAKER) revert NotMaker();
         if (p.validUntil != 0 && p.remaining != 0) {
@@ -199,6 +235,7 @@ contract AHyperQuoteHook is IUnlockCallback {
             if (SHARE.sharePrice() == 0) revert ZeroPrice();
             if (p.discountBps >= BPS) revert ZeroPrice();
             if (BPS - p.discountBps > MAX_BID_BPS) revert PriceAboveCeiling();
+            if (p.discountBps > MAX_BID_DISCOUNT_BPS) revert DiscountAboveMax();
         }
         params = p;
         emit ParamsSet(p);
@@ -253,8 +290,8 @@ contract AHyperQuoteHook is IUnlockCallback {
         return IHooks.beforeInitialize.selector;
     }
 
-    /// @notice Fills a swap that sells SHARE for ASSET entirely at the bid and returns a delta that leaves the AMM
-    /// nothing to swap. A swap that buys SHARE reverts.
+    /// @notice Fills a swap that sells SHARE for ASSET entirely at the bid, less the pool's protocol fee, and returns a
+    /// delta that leaves the AMM nothing to swap. A swap that buys SHARE reverts.
     function beforeSwap(address sender, PoolKey calldata key, IPoolManager.SwapParams calldata sp, bytes calldata)
         external
         onlyPoolManager
@@ -265,35 +302,92 @@ contract AHyperQuoteHook is IUnlockCallback {
         // Selling SHARE moves it from its own side of the pool to ASSET's.
         if (sp.zeroForOne != SHARE_IS_CURRENCY0) revert AskNotOffered();
 
+        (uint256 amountIn, uint256 amountOut) = _fill(sender, id, sp);
+        return (IHooks.beforeSwap.selector, _delta(id, sender, sp, amountIn, amountOut), 0);
+    }
+
+    /// @dev Prices and spends the fill, clears the hook's PoolManager deltas for the maker legs, pays the protocol fee
+    /// and emits Filled. Returns the swapper's amounts.
+    function _fill(address sender, PoolId id, IPoolManager.SwapParams calldata sp)
+        private
+        returns (uint256 amountIn, uint256 amountOut)
+    {
         bool exactInput = sp.amountSpecified < 0;
         uint256 specified = exactInput ? uint256(-sp.amountSpecified) : uint256(sp.amountSpecified);
-        (uint256 amountIn, uint256 amountOut, uint256 price) = _consume(exactInput, specified);
-        _settle(amountIn, amountOut);
-        emit Filled(sender, amountIn, amountOut, price);
+        ProtocolFee memory pf = _protocolFee(id, sp.zeroForOne);
+        (uint256 sharesIn, uint256 assetAmount, uint256 fee, uint256 price) = _consume(exactInput, specified, pf.pips);
+        _settle(sharesIn, assetAmount);
+        if (fee != 0) {
+            POOL_MANAGER.take(Currency.wrap(ASSET), pf.recipient, fee);
+            emit ProtocolFeesCollected(pf.recipient, Currency.wrap(ASSET), fee);
+        }
+        (amountIn, amountOut) = (sharesIn, assetAmount - fee);
+        emit Filled(sender, amountIn, amountOut, fee, price);
+    }
 
-        // Specified is the input for exact-in and the output for exact-out. A positive hook delta is owed to the hook,
-        // a negative one is owed by it; the swapper's side is the negation.
+    /// @dev Specified is the input for exact-in and the output for exact-out. A positive hook delta is owed to the
+    /// hook, a negative one is owed by it; the swapper's side is the negation.
+    function _delta(PoolId id, address sender, IPoolManager.SwapParams calldata sp, uint256 amountIn, uint256 amountOut)
+        private
+        returns (BeforeSwapDelta)
+    {
         int128 inDelta = amountIn.toInt128();
         int128 outDelta = amountOut.toInt128();
         if (sp.zeroForOne) emit HookSwap(PoolId.unwrap(id), sender, inDelta, -outDelta, 0, 0);
         else emit HookSwap(PoolId.unwrap(id), sender, -outDelta, inDelta, 0, 0);
-        BeforeSwapDelta delta =
-            exactInput ? toBeforeSwapDelta(inDelta, -outDelta) : toBeforeSwapDelta(-outDelta, inDelta);
-        return (IHooks.beforeSwap.selector, delta, 0);
+        return sp.amountSpecified < 0 ? toBeforeSwapDelta(inDelta, -outDelta) : toBeforeSwapDelta(-outDelta, inDelta);
+    }
+
+    // ------------------------------------------------------------------ protocol fee
+
+    /// @param pips The pool's protocol fee for the swap direction, in hundredths of a bip (at most 1,000).
+    /// @param recipient The TokenJar it is paid to.
+    struct ProtocolFee {
+        uint256 pips;
+        address recipient;
+    }
+
+    /// @dev Reads the pool's protocol fee for the swap direction from the PoolManager, where Uniswap governance sets it
+    /// through the protocolFeeController, and resolves the TokenJar from that controller. With no fee, or no
+    /// resolvable TokenJar (no code, a failed or out-of-gas call, under 32 bytes back, a word that is not a non-zero
+    /// address), nothing is charged (Uniswap's aggregator hooks do the same).
+    function _protocolFee(PoolId id, bool zeroForOne) private view returns (ProtocolFee memory pf) {
+        (,, uint24 raw,) = POOL_MANAGER.getSlot0(id);
+        uint256 pips = zeroForOne ? raw.getZeroForOneFee() : raw.getOneForZeroFee();
+        if (pips == 0) return pf;
+        address controller = POOL_MANAGER.protocolFeeController();
+        if (controller.code.length == 0) return pf;
+        // A bounded call that copies at most one word back, so no controller blocks fills by burning gas, returning
+        // a huge payload or returning a word that is not an address.
+        bytes4 selector = IProtocolFeeAdapter.TOKEN_JAR.selector;
+        bool ok;
+        uint256 word;
+        assembly ("memory-safe") {
+            let ptr := mload(0x40)
+            mstore(ptr, selector)
+            ok := staticcall(TOKEN_JAR_GAS, controller, ptr, 4, ptr, 32)
+            if lt(returndatasize(), 32) { ok := 0 }
+            word := mload(ptr)
+        }
+        if (!ok || word >> 160 != 0 || word == 0) return pf;
+        pf = ProtocolFee({pips: pips, recipient: address(uint160(word))});
     }
 
     // ------------------------------------------------------------------ pricing
 
     /// @dev Checks the quote and the strategy, prices the fill at the live sharePrice() and spends it from `remaining`
-    /// (counted in SHARE in). The bid in ASSET base units per SHARE base unit is
-    /// price x (10,000 - d) / (PRECISION x 10,000).
-    /// Exact-in (SHARE in): out = floor(in x price x (10,000 - d) / (PRECISION x 10,000)).
-    /// Exact-out (ASSET out): in = ceil(out x PRECISION x 10,000 / (price x (10,000 - d))).
-    /// Both round in the maker's favour. The realised amounts are then checked against the ceiling:
-    /// out x PRECISION x 10,000 <= in x price x MAX_BID_BPS, i.e. out <= floor(in x price x MAX_BID_BPS / den).
-    function _consume(bool exactInput, uint256 specified)
+    /// (counted in SHARE in). Returns the maker's legs (SHARE in, ASSET paid out of VAULT) and the protocol fee, which
+    /// sits between the maker's ASSET leg and the swapper's. The bid in ASSET base units per SHARE base unit is
+    /// price x (10,000 - d) / (PRECISION x 10,000); f is the fee in pips, rounded up:
+    /// - Exact-in (SHARE in): asset = floor(in x num / den), fee = ceil(asset x f / 1e6), the swapper receives
+    ///   asset - fee.
+    /// - Exact-out (ASSET out): fee = ceil(out x f / (1e6 - f)), asset = out + fee,
+    ///   in = ceil(asset x den / num).
+    /// Rounding favours the maker. The maker legs are then checked against the ceiling:
+    /// asset x PRECISION x 10,000 <= in x price x MAX_BID_BPS, i.e. asset <= floor(in x price x MAX_BID_BPS / den).
+    function _consume(bool exactInput, uint256 specified, uint256 feePips)
         private
-        returns (uint256 amountIn, uint256 amountOut, uint256 price)
+        returns (uint256 amountIn, uint256 assetAmount, uint256 fee, uint256 price)
     {
         Params memory p = params;
         if (block.timestamp > p.validUntil) revert QuoteExpired();
@@ -307,14 +401,17 @@ contract AHyperQuoteHook is IUnlockCallback {
         if (exactInput) {
             amountIn = specified;
             if (amountIn > p.remaining) revert AmountExceedsRemaining();
-            amountOut = FullMath.mulDiv(amountIn, num, den);
+            assetAmount = FullMath.mulDiv(amountIn, num, den);
+            fee = FullMath.mulDivRoundingUp(assetAmount, feePips, PIPS);
+            if (assetAmount <= fee) revert ZeroAmount();
         } else {
-            amountOut = specified;
-            amountIn = FullMath.mulDivRoundingUp(amountOut, den, num);
+            if (specified == 0) revert ZeroAmount();
+            fee = FullMath.mulDivRoundingUp(specified, feePips, PIPS - feePips);
+            assetAmount = specified + fee;
+            amountIn = FullMath.mulDivRoundingUp(assetAmount, den, num);
             if (amountIn > p.remaining) revert AmountExceedsRemaining();
         }
-        if (amountOut == 0) revert ZeroAmount();
-        if (amountOut > FullMath.mulDiv(amountIn, price * MAX_BID_BPS, den)) revert PriceAboveCeiling();
+        if (assetAmount > FullMath.mulDiv(amountIn, price * MAX_BID_BPS, den)) revert PriceAboveCeiling();
         params.remaining = uint128(p.remaining - amountIn);
     }
 
@@ -327,17 +424,18 @@ contract AHyperQuoteHook is IUnlockCallback {
 
     // ------------------------------------------------------------------ settlement
 
-    /// @dev Clears the hook's PoolManager deltas for a fill: +amountIn SHARE as a claim, -amountOut ASSET withdrawn
-    /// from the maker's VAULT position straight into the PoolManager (VAULT pulls it from its markets and reverts the
-    /// whole swap if they lack the liquidity). The sync/settle pair here overwrites any sync the caller left pending,
+    /// @dev Clears the hook's PoolManager deltas for a fill's maker legs: +amountIn SHARE as a claim, -assetAmount ASSET
+    /// withdrawn from the maker's VAULT position straight into the PoolManager, protocol fee included (VAULT pulls it
+    /// from its markets and reverts the whole swap if they lack the liquidity; `_fill` then takes the fee out to the
+    /// TokenJar). The sync/settle pair here overwrites any sync the caller left pending,
     /// so a caller that syncs and transfers its input before calling swap and settles afterwards reverts with
     /// CurrencyNotSettled; routers that sync, pay and settle atomically (UniversalRouter V4Router) are unaffected.
-    function _settle(uint256 amountIn, uint256 amountOut) private {
+    function _settle(uint256 amountIn, uint256 assetAmount) private {
         // The seller's share reaches the PoolManager only when the router settles after this swap, so it cannot be
         // taken yet; the claim is backed by that settlement and is swept to MAKER later.
         POOL_MANAGER.mint(address(this), SHARE_ID, amountIn);
         POOL_MANAGER.sync(Currency.wrap(ASSET));
-        VAULT.withdraw(amountOut, address(POOL_MANAGER), MAKER);
+        VAULT.withdraw(assetAmount, address(POOL_MANAGER), MAKER);
         POOL_MANAGER.settle();
     }
 }

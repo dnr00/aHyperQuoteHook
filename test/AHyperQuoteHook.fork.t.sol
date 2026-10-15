@@ -123,6 +123,8 @@ abstract contract AHyperHookForkBase is Test {
 
     uint256 constant SHARE_PRICE = 1_082_724_080_175_656_923_778_690_918_203_191_386;
     uint256 constant MAX_BID_BPS = 9_990;
+    /// @dev The swapper-side band: the bid never pays less than sharePrice x (1 - 3%).
+    uint256 constant MAX_BID_DISCOUNT_BPS = 300;
     uint16 constant DISCOUNT = 25;
     uint128 constant REMAINING = 1_000_000e6;
     uint256 constant MAKER_DEPOSIT = 6_000_000e6;
@@ -130,6 +132,8 @@ abstract contract AHyperHookForkBase is Test {
     /// @dev beforeInitialize | beforeSwap | beforeSwapReturnDelta.
     uint160 constant HOOK_FLAGS = 0x2088;
     /// @dev 1,234.567890 aHYPER: odd digits so every rounding shows.
+    /// @dev Gas given to each router swap; 0 forwards everything.
+    uint256 swapGas;
     uint256 constant X = 1_234_567_890;
     /// @dev floor(X x SHARE_PRICE x 9,975 / (1e36 x 10,000)).
     uint256 constant X_OUT_25 = 1_333_354_642;
@@ -180,7 +184,9 @@ abstract contract AHyperHookForkBase is Test {
         address hookAddr = address(uint160((uint256(keccak256("AHyperQuoteHook")) & ~uint256(0x3FFF)) | HOOK_FLAGS));
         assertEq(hookAddr.code.length, 0, "hook address is empty on Monad");
         deployCodeTo(
-            "AHyperQuoteHook.sol:AHyperQuoteHook", abi.encode(POOL_MANAGER, APEX, AHYPER, maker, MAX_BID_BPS), hookAddr
+            "AHyperQuoteHook.sol:AHyperQuoteHook",
+            abi.encode(POOL_MANAGER, APEX, AHYPER, maker, MAX_BID_BPS, MAX_BID_DISCOUNT_BPS),
+            hookAddr
         );
         hook = AHyperQuoteHook(hookAddr);
         key = PoolKey({
@@ -261,7 +267,9 @@ abstract contract AHyperHookForkBase is Test {
         inputs[0] = abi.encode(actions, params);
         vm.prank(seller);
         uint256 g = gasleft();
-        IUniversalRouter(UNIVERSAL_ROUTER).execute(abi.encodePacked(uint8(0x10)), inputs, block.timestamp);
+        IUniversalRouter(UNIVERSAL_ROUTER).execute{gas: swapGas == 0 ? gasleft() : swapGas}(
+            abi.encodePacked(uint8(0x10)), inputs, block.timestamp
+        );
         gasUsed = g - gasleft();
     }
 
@@ -339,6 +347,7 @@ contract AHyperQuoteHookForkTest is AHyperHookForkBase, IUnlockCallback {
         assertEq(hook.ASSET(), USDC);
         assertEq(hook.MAKER(), maker);
         assertEq(hook.MAX_BID_BPS(), MAX_BID_BPS);
+        assertEq(hook.MAX_BID_DISCOUNT_BPS(), MAX_BID_DISCOUNT_BPS);
         assertEq(hook.PRECISION(), 1e36);
         assertFalse(hook.SHARE_IS_CURRENCY0(), "aHYPER sorts above USDC");
         assertEq(PoolId.unwrap(hook.POOL_ID()), PoolId.unwrap(key.toId()), "canonical pool key");
@@ -350,22 +359,34 @@ contract AHyperQuoteHookForkTest is AHyperHookForkBase, IUnlockCallback {
 
     /// @dev Every config check runs before the permission check, so a plain deployment at an arbitrary address reaches it.
     function test_constructor_rejectsBadConfig() public {
-        _expectBadConfig(address(0), APEX, AHYPER, maker, MAX_BID_BPS);
-        _expectBadConfig(POOL_MANAGER, APEX, address(0), maker, MAX_BID_BPS);
-        _expectBadConfig(POOL_MANAGER, APEX, AHYPER, address(0), MAX_BID_BPS);
-        _expectBadConfig(POOL_MANAGER, APEX, AHYPER, maker, 0);
-        _expectBadConfig(POOL_MANAGER, APEX, AHYPER, maker, 10_001);
+        _expectBadConfig(address(0), APEX, AHYPER, maker, MAX_BID_BPS, MAX_BID_DISCOUNT_BPS);
+        _expectBadConfig(POOL_MANAGER, APEX, address(0), maker, MAX_BID_BPS, MAX_BID_DISCOUNT_BPS);
+        _expectBadConfig(POOL_MANAGER, APEX, AHYPER, address(0), MAX_BID_BPS, MAX_BID_DISCOUNT_BPS);
+        _expectBadConfig(POOL_MANAGER, APEX, AHYPER, maker, 0, MAX_BID_DISCOUNT_BPS);
+        _expectBadConfig(POOL_MANAGER, APEX, AHYPER, maker, 10_001, MAX_BID_DISCOUNT_BPS);
+        // The discount band must hold at least one value: 10,000 - maxBidBps <= d <= maxBidDiscountBps < 10,000.
+        _expectBadConfig(POOL_MANAGER, APEX, AHYPER, maker, MAX_BID_BPS, 9);
+        _expectBadConfig(POOL_MANAGER, APEX, AHYPER, maker, MAX_BID_BPS, 10_000);
         // Hyperithm AUSD Degen pays AUSD, not the USDC aHYPER is denominated in.
-        _expectBadConfig(POOL_MANAGER, 0x94D7162c82F2007d65f12fbD78854f2CcF7B29f6, AHYPER, maker, MAX_BID_BPS);
-        // A valid config at an address without the hook's flags.
+        _expectBadConfig(
+            POOL_MANAGER, 0x94D7162c82F2007d65f12fbD78854f2CcF7B29f6, AHYPER, maker, MAX_BID_BPS, MAX_BID_DISCOUNT_BPS
+        );
+        // A valid config at an address without the hook's flags (a one-value band, 10 = 10, is valid).
         address next = vm.computeCreateAddress(address(this), vm.getNonce(address(this)));
         vm.expectRevert(abi.encodeWithSelector(Hooks.HookAddressNotValid.selector, next));
-        new AHyperQuoteHook(POOL_MANAGER, APEX, AHYPER, maker, MAX_BID_BPS);
+        new AHyperQuoteHook(POOL_MANAGER, APEX, AHYPER, maker, MAX_BID_BPS, 10);
     }
 
-    function _expectBadConfig(address pm_, address vault, address share, address maker_, uint256 maxBidBps) private {
+    function _expectBadConfig(
+        address pm_,
+        address vault,
+        address share,
+        address maker_,
+        uint256 maxBidBps,
+        uint256 maxBidDiscountBps
+    ) private {
         vm.expectRevert(AHyperQuoteHook.BadConfig.selector);
-        new AHyperQuoteHook(pm_, vault, share, maker_, maxBidBps);
+        new AHyperQuoteHook(pm_, vault, share, maker_, maxBidBps, maxBidDiscountBps);
     }
 
     // ------------------------------------------------------------------ fills
@@ -413,11 +434,12 @@ contract AHyperQuoteHookForkTest is AHyperHookForkBase, IUnlockCallback {
         for (uint256 i; i < logs.length; ++i) {
             if (logs[i].emitter != address(hook)) continue;
             if (logs[i].topics[0] == AHyperQuoteHook.Filled.selector) {
-                (address sender, uint256 sharesIn, uint256 assetsOut, uint256 price) =
-                    abi.decode(logs[i].data, (address, uint256, uint256, uint256));
+                (address sender, uint256 sharesIn, uint256 assetsOut, uint256 fee, uint256 price) =
+                    abi.decode(logs[i].data, (address, uint256, uint256, uint256, uint256));
                 assertEq(sender, UNIVERSAL_ROUTER);
                 assertEq(sharesIn, X);
                 assertEq(assetsOut, X_OUT_25);
+                assertEq(fee, 0, "no protocol fee is set on Monad");
                 assertEq(price, SHARE_PRICE);
                 filled = true;
             } else if (logs[i].topics[0] == AHyperQuoteHook.HookSwap.selector) {
@@ -469,10 +491,13 @@ contract AHyperQuoteHookForkTest is AHyperHookForkBase, IUnlockCallback {
     }
 
     /// @dev At a 10% discount one aHYPER base unit is worth 0.97 USDC base units, which floors to zero.
-    function test_dustThatPaysZero_reverts() public {
-        _post(1_000, REMAINING);
-        _expectSwapRevert(abi.encodeWithSelector(AHyperQuoteHook.ZeroAmount.selector));
-        _swap(true, true, 1, 0);
+    /// @dev Inside the swapper band a single base unit still pays: floor(1 x SHARE_PRICE x 9,700 / (1e36 x 10,000)) = 1.
+    /// The zero-output revert is reached through the protocol fee (test_protocolFee_dustOutputReverts).
+    function test_dustAtTheMaxDiscount_paysOneUnit() public {
+        _post(uint16(MAX_BID_DISCOUNT_BPS), REMAINING);
+        (uint256 paid, uint256 received) = _sell(true, 1, 0);
+        assertEq(paid, 1);
+        assertEq(received, 1);
     }
 
     function test_killSwitch_validUntilZero_and_remainingZero() public {
@@ -590,8 +615,20 @@ contract AHyperQuoteHookForkTest is AHyperHookForkBase, IUnlockCallback {
         hook.setParams(AHyperQuoteHook.Params({validUntil: validUntil, discountBps: 9, remaining: 1}), REMAINING);
         vm.expectRevert(AHyperQuoteHook.ZeroPrice.selector);
         hook.setParams(AHyperQuoteHook.Params({validUntil: validUntil, discountBps: 10_000, remaining: 1}), REMAINING);
+        // The swapper-side band: the maker cannot move a swap in flight below sharePrice x (1 - 3%).
+        vm.expectRevert(AHyperQuoteHook.DiscountAboveMax.selector);
+        hook.setParams(
+            AHyperQuoteHook.Params({
+                validUntil: validUntil, discountBps: uint16(MAX_BID_DISCOUNT_BPS + 1), remaining: 1
+            }),
+            REMAINING
+        );
+        hook.setParams(
+            AHyperQuoteHook.Params({validUntil: validUntil, discountBps: uint16(MAX_BID_DISCOUNT_BPS), remaining: 1}),
+            REMAINING
+        );
         // Closed bids are not checked.
-        hook.setParams(AHyperQuoteHook.Params({validUntil: validUntil, discountBps: 0, remaining: 0}), REMAINING);
+        hook.setParams(AHyperQuoteHook.Params({validUntil: validUntil, discountBps: 0, remaining: 0}), 1);
         hook.setParams(AHyperQuoteHook.Params({validUntil: 0, discountBps: 60_000, remaining: 1}), 0);
         vm.stopPrank();
     }
@@ -852,19 +889,119 @@ contract AHyperQuoteHookForkTest is AHyperHookForkBase, IUnlockCallback {
 
     // ------------------------------------------------------------------ protocol fee
 
-    function test_maxProtocolFee_takesNothing() public {
-        address controller = makeAddr("controller");
+    // Expected amounts at the maximum fee (1,000 pips), computed outside Solidity with exact integer arithmetic:
+    // exact-in X: maker pays X_OUT_25, fee = ceil(X_OUT_25 x 1,000 / 1e6), the seller receives the rest;
+    // exact-out 1,000 USDC: fee = ceil(1,000e6 x 1,000 / 999,000), maker pays 1,000e6 + fee, and the seller sells
+    // ceil((1,000e6 + fee) x 1e36 x 10,000 / (SHARE_PRICE x 9,975)).
+    uint256 constant FEE_X = 1_333_355;
+    uint256 constant FEE_1000 = 1_001_002;
+    uint256 constant IN_FOR_1000_25_FEE = 926_837_959;
+
+    /// @dev Installs a protocol fee controller exposing TOKEN_JAR, as Uniswap's V4FeeAdapter does where governance has
+    /// set one (Monad has none at the fork block), and sets `fee` on the pool through it.
+    function _setProtocolFee(uint24 fee) internal returns (address jar) {
+        jar = makeAddr("tokenJar");
+        FeeAdapterMock adapter = new FeeAdapterMock(jar);
         vm.prank(IPoolManagerOwned(POOL_MANAGER).owner());
-        IPoolManagerOwned(POOL_MANAGER).setProtocolFeeController(controller);
-        vm.prank(controller);
-        pm.setProtocolFee(key, 1000 | (1000 << 12));
+        IPoolManagerOwned(POOL_MANAGER).setProtocolFeeController(address(adapter));
+        adapter.set(pm, key, fee);
+    }
+
+    /// @dev Selling aHYPER (currency1) is oneForZero, so its fee is the upper 12 bits.
+    function test_protocolFee_exactIn_paidBySellerToTheJar() public {
+        address jar = _setProtocolFee(1000 << 12);
+        uint256 makerApexBefore = apex.balanceOf(maker);
+        uint256 sharesForMakerLeg = apex.previewWithdraw(X_OUT_25);
+        vm.expectEmit(true, true, false, true, address(hook));
+        emit AHyperQuoteHook.ProtocolFeesCollected(jar, Currency.wrap(USDC), FEE_X);
+        (uint256 paid, uint256 received) = _sell(true, X, 0);
+        assertEq(paid, X, "aHYPER sold");
+        assertEq(received, X_OUT_25 - FEE_X, "seller pays the fee");
+        assertEq(IERC20Like(USDC).balanceOf(jar), FEE_X, "fee to the TokenJar");
+        assertEq(makerApexBefore - apex.balanceOf(maker), sharesForMakerLeg, "maker pays its price, fee included");
+        assertEq(_remaining(), REMAINING - X);
+        assertEq(_claim(USDC), 0, "no USDC left in the PoolManager for the hook");
+    }
+
+    function test_protocolFee_exactOut_paidBySellerToTheJar() public {
+        address jar = _setProtocolFee(1000 << 12);
+        uint256 makerApexBefore = apex.balanceOf(maker);
+        uint256 sharesForMakerLeg = apex.previewWithdraw(1_000e6 + FEE_1000);
+        (uint256 paid, uint256 received) = _sell(false, 1_000e6, type(uint128).max);
+        assertEq(received, 1_000e6, "seller receives what it asked for");
+        assertEq(paid, IN_FOR_1000_25_FEE, "and sells enough to cover the fee");
+        assertEq(IERC20Like(USDC).balanceOf(jar), FEE_1000);
+        assertEq(makerApexBefore - apex.balanceOf(maker), sharesForMakerLeg);
+        assertEq(_remaining(), REMAINING - IN_FOR_1000_25_FEE);
+    }
+
+    function test_protocolFee_onlyTheSwapDirectionsFeeApplies() public {
+        address jar = _setProtocolFee(1000); // zeroForOne only: buying aHYPER, which the hook refuses
+        _sellAndCheck(true, X, X, X_OUT_25);
+        assertEq(IERC20Like(USDC).balanceOf(jar), 0);
+    }
+
+    function test_protocolFee_doesNotAccrueInThePoolManager() public {
+        _setProtocolFee(1000 | (1000 << 12));
         uint256 feesUsdc = pm.protocolFeesAccrued(Currency.wrap(USDC));
         uint256 feesShare = pm.protocolFeesAccrued(Currency.wrap(AHYPER));
+        _sell(true, X, 0);
+        assertEq(pm.protocolFeesAccrued(Currency.wrap(USDC)), feesUsdc, "the fee went to the jar, not to accrual");
+        assertEq(pm.protocolFeesAccrued(Currency.wrap(AHYPER)), feesShare);
+    }
 
+    /// @dev Uniswap's aggregator hooks charge nothing when the controller names no TokenJar; so does this one.
+    /// @dev The swap gets a realistic budget here, so a controller that burns gas or returns a huge payload would make
+    /// it run out if the hook forwarded all gas or copied all return data.
+    function test_protocolFee_hostileController_neverBlocksFills() public {
+        HostileFeeController c = new HostileFeeController();
+        vm.prank(IPoolManagerOwned(POOL_MANAGER).owner());
+        IPoolManagerOwned(POOL_MANAGER).setProtocolFeeController(address(c));
+        c.set(pm, key, 1000 << 12);
+        swapGas = 1_000_000;
+        for (uint8 mode = 1; mode <= 5; mode++) {
+            c.setMode(mode);
+            _sellAndCheck(true, X, X, X_OUT_25);
+        }
+        assertEq(IERC20Like(USDC).balanceOf(c.JAR()), 0);
+        c.setMode(0); // a well-behaved controller is still honoured under the same budget
+        (, uint256 received) = _sell(true, X, 0);
+        assertEq(received, X_OUT_25 - FEE_X);
+        assertEq(IERC20Like(USDC).balanceOf(c.JAR()), FEE_X);
+    }
+
+    function test_protocolFee_noTokenJar_chargesNothing() public {
+        address jar = _setProtocolFee(1000 << 12);
+        address controller = pm.protocolFeeController();
+        vm.mockCallRevert(controller, abi.encodeCall(IFeeAdapterLike.TOKEN_JAR, ()), "");
         _sellAndCheck(true, X, X, X_OUT_25);
-        _sellAndCheck(false, 1_000e6, IN_FOR_1000_25, 1_000e6);
-        assertEq(pm.protocolFeesAccrued(Currency.wrap(USDC)), feesUsdc, "USDC protocol fees unchanged");
-        assertEq(pm.protocolFeesAccrued(Currency.wrap(AHYPER)), feesShare, "aHYPER protocol fees unchanged");
+        // A revert whose data happens to decode as an address names no jar either.
+        vm.mockCallRevert(controller, abi.encodeCall(IFeeAdapterLike.TOKEN_JAR, ()), abi.encode(jar));
+        _sellAndCheck(true, X, X, X_OUT_25);
+        vm.mockCall(controller, abi.encodeCall(IFeeAdapterLike.TOKEN_JAR, ()), abi.encode(address(0)));
+        _sellAndCheck(true, X, X, X_OUT_25);
+        assertEq(IERC20Like(USDC).balanceOf(jar), 0);
+    }
+
+    /// @dev 1 base unit of aHYPER is worth 1 base unit of USDC at the bid, all of which would be the fee.
+    function test_protocolFee_dustOutputReverts() public {
+        _setProtocolFee(1000 << 12);
+        _expectSwapRevert(abi.encodeWithSelector(AHyperQuoteHook.ZeroAmount.selector));
+        _swap(true, true, 1, 0);
+    }
+
+    function test_protocolFee_quoterMatchesSwap() public {
+        _setProtocolFee(1000 << 12);
+        (uint256 quotedOut,) = IV4Quoter(V4_QUOTER)
+            .quoteExactInputSingle(
+                QuoteExactSingleParams({poolKey: key, zeroForOne: false, exactAmount: uint128(X), hookData: ""})
+            );
+        (uint256 quotedIn,) = IV4Quoter(V4_QUOTER)
+            .quoteExactOutputSingle(
+                QuoteExactSingleParams({poolKey: key, zeroForOne: false, exactAmount: 1_000e6, hookData: ""})
+            );
+        assertEq(quotedOut, X_OUT_25 - FEE_X, "exact-in quote nets the fee");
+        assertEq(quotedIn, IN_FOR_1000_25_FEE, "exact-out quote covers the fee");
     }
 
     // ------------------------------------------------------------------ liquidity
@@ -1008,5 +1145,68 @@ contract AHyperQuoteHookFrontRunMinPriceForkTest is FrontRunInitCases {
 contract AHyperQuoteHookFrontRunMaxPriceForkTest is FrontRunInitCases {
     function _initPrice() internal pure override returns (uint160) {
         return TickMath.MAX_SQRT_PRICE - 1;
+    }
+}
+
+/// @dev Stands in for Uniswap's V4FeeAdapter: the PoolManager's protocolFeeController, which names the TokenJar.
+contract FeeAdapterMock {
+    address public immutable TOKEN_JAR;
+
+    constructor(address jar) {
+        TOKEN_JAR = jar;
+    }
+
+    function set(IPoolManager pm, PoolKey memory key, uint24 fee) external {
+        pm.setProtocolFee(key, fee);
+    }
+}
+
+interface IFeeAdapterLike {
+    function TOKEN_JAR() external view returns (address);
+}
+
+/// @dev TOKEN_JAR() that, by mode: 0 answers JAR; 1 reverts with 1 MiB; 2 burns all its gas; 3 returns a word that is
+/// not an address; 4 returns 1 MiB; 5 returns 31 bytes of an address word, which a reader that ignores the size
+/// would complete with its own buffer into a plausible address.
+contract HostileFeeController {
+    address public constant JAR = address(0x7A7a7A7a7a7a7a7A7a7a7a7A7a7A7A7A7A7A7a7A);
+    uint8 public mode;
+
+    function setMode(uint8 m) external {
+        mode = m;
+    }
+
+    function set(IPoolManager pm, PoolKey memory key, uint24 fee) external {
+        pm.setProtocolFee(key, fee);
+    }
+
+    function TOKEN_JAR() external view returns (address) {
+        uint8 m = mode;
+        if (m == 1) {
+            assembly {
+                revert(0, 0x100000)
+            }
+        }
+        if (m == 2) {
+            while (true) {}
+        }
+        if (m == 3) {
+            assembly {
+                mstore(0, not(0))
+                return(0, 32)
+            }
+        }
+        if (m == 4) {
+            assembly {
+                return(0, 0x100000)
+            }
+        }
+        if (m == 5) {
+            assembly {
+                mstore(0, 0x7a7A7a7a7a7a7A7a7a7a7a7A7a7a7a7A7A7a7a7A)
+                return(0, 31)
+            }
+        }
+        return JAR;
     }
 }
